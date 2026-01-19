@@ -1,6 +1,6 @@
 #! /bin/env python
 
-# Copyright (C) 2022 Greg Landrum
+# Copyright (C) 2022-2026 ETH Zurich, Greg Landrum, and other lwreg contributors
 # All rights reserved
 # This file is part of lwreg.
 # The contents are covered by the terms of the MIT license
@@ -9,6 +9,9 @@ import click
 import logging
 import sys
 from . import utils
+from . import helpers
+import json
+import os
 
 
 @click.group()
@@ -17,6 +20,8 @@ from . import utils
     default='',
 )
 def cli(config=''):
+    if config == '' and 'LWREG_CONFIG' in os.environ:
+        config = os.environ['LWREG_CONFIG']
     utils._configure(filename=config)
 
 
@@ -29,7 +34,7 @@ def initdb(confirm='no'):
     if confirm != 'yes':
         click.echo("initdb not confirmed, aborting")
         return
-    utils.initdb(confirm=True)
+    utils._initdb(confirm=True)
 
 
 @cli.command()
@@ -70,7 +75,9 @@ def query(**kwargs):
     "--smiles",
     default=None,
 )
-@click.option("--fail-on-duplicate", default=True, is_flag=True)
+@click.option("--fail-on-duplicate/--no-fail-on-duplicate",
+              default=True,
+              is_flag=True)
 @click.option(
     "--escape",
     default=None,
@@ -82,6 +89,15 @@ def register(**kwargs):
     except utils._violations:
         logging.error("Compound already registered")
         sys.exit(1)
+
+
+## need to think about how to best pass it back
+@cli.command()
+def interactive_config():
+    config = helpers.interactive_config()
+    with open("./config.json", "w") as f:
+        json.dump(config, f)
+    click.echo("Saved the configuration to ./config.json")
 
 
 @cli.command()

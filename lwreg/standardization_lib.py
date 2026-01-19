@@ -1,11 +1,20 @@
-# Copyright (C) 2023 Greg Landrum
+# Copyright (C) 2023-2026 ETH Zurich, Greg Landrum, and other lwreg contributors
 # All rights reserved
 # This file is part of lwreg.
 # The contents are covered by the terms of the MIT license
 # which is included in the file LICENSE,
 
 from rdkit import Chem
-from rdkit.Chem.MolStandardize import rdMolStandardize
+
+import warnings
+
+# MolStandardize generates a pile of deprecation warnings in the 2023.09 release
+# of RDKit. We aren't using any of the deprecated code and can ignore the
+# warnings here
+with warnings.catch_warnings():
+    warnings.filterwarnings("ignore", category=DeprecationWarning)
+    from rdkit.Chem.MolStandardize import rdMolStandardize
+from rdkit.Chem import rdMolTransforms
 
 
 class Standardization:
@@ -16,6 +25,33 @@ class Standardization:
     __slots__ = ["name", "explanation"]
 
     def __call__(self, mol):
+        return mol
+
+
+class NoStandardization(Standardization):
+    name = "no_standardization"
+    explanation = "does not modify the molecule"
+
+    def __call__(self, mol):
+        return mol
+
+
+class RemoveHs(Standardization):
+    name = "remove_hs"
+    explanation = "removes hydrogens from the molecule"
+
+    def __call__(self, mol):
+        return Chem.RemoveHs(mol)
+
+
+class CanonicalizeOrientation(Standardization):
+    name = "canonicalize_orientation"
+    explanation = "canonicalizes the orientation of the molecule's 3D conformers (if present)"
+
+    def __call__(self, mol):
+        for conf in mol.GetConformers():
+            if conf.Is3D():
+                rdMolTransforms.CanonicalizeConformer(conf)
         return mol
 
 

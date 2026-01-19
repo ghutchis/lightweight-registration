@@ -1,4 +1,4 @@
-# Copyright (C) 2022 Greg Landrum
+# Copyright (C) 2022-2026 ETH Zurich, Greg Landrum, and other lwreg contributors
 # All rights reserved
 # This file is part of lwreg.
 # The contents are covered by the terms of the MIT license
@@ -8,40 +8,54 @@ import rdkit
 from rdkit import Chem
 from rdkit import rdBase
 from rdkit.Chem import RegistrationHash
+from hashlib import sha256
 import csv
 import json
 import sqlite3
 import enum
+import os.path
 from . import standardization_lib
+import logging
+from tqdm import tqdm
+import base64
+import warnings
 
 _violations = (sqlite3.IntegrityError, )
 try:
-    import psycopg2
-    _violations = (sqlite3.IntegrityError, psycopg2.errors.UniqueViolation)
+    import psycopg
+    _violations = (sqlite3.IntegrityError, psycopg.errors.UniqueViolation)
 except ImportError:
-    psycopg2 = None
+    psycopg = None
 
 from collections import namedtuple
 
 standardizationOptions = {
-    'none': lambda x: x,
+    'none': standardization_lib.NoStandardization(),
     'sanitize': standardization_lib.RDKitSanitize(),
     'fragment': standardization_lib.FragmentParent(),
     'charge': standardization_lib.ChargeParent(),
     'tautomer': standardization_lib.TautomerParent(),
     'super': standardization_lib.SuperParent(),
+    'canonicalize': standardization_lib.CanonicalizeOrientation(),
 }
 
-_defaultConfig = json.loads('''{
+_defaultConfig = {
     "dbname": "./testdb.sqlt",
     "dbtype": "sqlite3",
     "standardization": "fragment",
     "removeHs": 1,
-    "use3DIfPresent": 1,
-    "useTautomerHashv2": 0
-}''')
+    "useTautomerHashv2": 0,
+    "registerConformers":
+    0,  # toggle registering conformers as well as compound structures
+    "numConformerDigits":
+    3,  # number of digits to use when hashing conformer coordinates
+    "lwregSchema":
+    "",  # the schema name to use for the lwreg tables (no effect with sqlite3)
+    "cacheConnection": True,
+}
 
 from rdkit.Chem.RegistrationHash import HashLayer
+from rdkit.Chem import KekulizeException
 
 
 class RegistrationFailureReasons(enum.Enum):
@@ -55,6 +69,104 @@ def defaultConfig():
 
 
 _config = {}
+
+
+def configure_from_database(dbname=None,
+                            connection=None,
+                            dbtype=None,
+                            host=None,
+                            user=None,
+                            password=None,
+                            lwregSchema=None,
+                            cacheConnection=True):
+    """
+    Returns a config dict with values from the registration metadata table in the database.
+
+    Note that in order for this to work the arguments must provide whatever
+    information is needed to connect to the database. This can be 'connection'
+    with a direct connection object or 'dbname' and 'dbtype' (potentially with
+    'host', 'user', and 'password' if those are required). If you used a
+    nondefault schema when initializing the database, you'll also need to
+    provide 'lwregSchema' here.
+    If 'dbtype' is not provided, the following heuristics are used:
+
+      - if 'dbname' corresponds to an existing file, then sqlite3 is used
+      - if 'host' is provided, then postgresql is used
+      - otherwise the default dbtype, currently sqlite3, is used
+
+    :param dbname: the name of the database (one of dbname or connection must be provided)
+    :param connection: a connection object (one of dbname or connection must be provided)
+    :param dbtype: the type of database (sqlite3 or postgresql)
+    :param host: the host to connect to (for postgresql)
+    :param user: the user to connect as (for postgresql)
+    :param password: the password to use (for postgresql)
+    :param lwregSchema: the schema name to use for the lwreg tables (for postgresql)
+    :param bool cacheConnection: Cache connection after retrieveing the config
+    :return: A config dictionary with values from the registration metadata table in the database.
+    :raises ValueError: If neither dbname nor connection is provided.
+    """
+    global _config
+    config = {}
+    if connection is not None:
+        config['connection'] = connection
+    elif dbname is not None:
+        config['dbname'] = dbname
+    else:
+        raise ValueError(
+            'at least one of dbname or connection must be provided')
+
+    if dbtype is not None:
+        config['dbtype'] = dbtype
+    else:
+        if os.path.exists(dbname):
+            # if the db is a file, then we'll assume sqlite
+            config['dbtype'] = 'sqlite3'
+        elif host is not None:
+            # if they provided a host, it's probably postgresql
+            config['dbtype'] = 'postgresql'
+
+    if host is not None:
+        config['host'] = host
+    if user is not None:
+        config['user'] = user
+    if password is not None:
+        config['password'] = password
+    if lwregSchema is not None:
+        config['lwregSchema'] = lwregSchema
+    config["cacheConnection"] = cacheConnection
+    if 'connection' in config:
+        cn = config['connection']
+    else:
+        cn = connect(config)
+    curs = cn.cursor()
+    curs.execute(f'select * from {registrationMetadataTableName}')
+    rows = curs.fetchall()
+    for k, v in rows:
+        if k in ('rdkitVersion', 'user', 'password'):
+            continue
+        try:
+            v = int(v)
+        except ValueError:
+            try:
+                v = float(v)
+            except ValueError:
+                pass
+        config[k] = v
+    _config = config
+    return config
+
+
+def set_default_config(config):
+    ''' Sets the default configuration to be used by the other functions in 
+    this module to the configuration object which is passed in
+    
+    :param config: configuration dict
+    :return: None
+
+    '''
+    global _config
+    assert isinstance(config, dict)
+    _config = config
 
 
 def _configure(filename='./config.json'):
@@ -76,11 +188,41 @@ _replace_placeholders_noop = lambda x: x
 _replace_placeholders_pcts = lambda x: x.replace('?', '%s').replace('"', '')
 _replace_placeholders = _replace_placeholders_noop
 
+_baseregistrationMetadataTableName = 'registration_metadata'
+_baseorigDataTableName = 'orig_data'
+_basehashTableName = 'hashes'
+_basemolblocksTableName = 'molblocks'
+_baseconformersTableName = 'conformers'
 
-def _connect(config):
+_dbConnection = None
+_dbConfig = None
+
+
+def connect(config):
+    ''' Creates a connection to the database and returns it
+    
+    :param config: configuration dict
+    :return: a database connection object (by default this is cached and reused in subsequent calls)
+    '''
     global _replace_placeholders
     global _dbtype
+    global _dbConnection
+    global _dbConfig
+    global registrationMetadataTableName
+    global origDataTableName
+    global hashTableName
+    global molblocksTableName
+    global conformersTableName
+    global lwregSchema
+
+    if not config:
+        config = _configure()
+    elif isinstance(config, str):
+        config = _configure(filename=config)
+
     cn = config.get('connection', None)
+    if not cn and _dbConnection is not None and _dbConfig == config:
+        cn = _dbConnection
     dbtype = _lookupWithDefault(config, 'dbtype').lower()
     if not cn:
         dbnm = config['dbname']
@@ -89,21 +231,43 @@ def _connect(config):
             if dbnm.startswith('file::'):
                 uri = True
             cn = sqlite3.connect(dbnm, uri=uri)
-        elif dbtype in ('postgres', 'postgresql'):
-            dbtype = 'postgresql'
-            if psycopg2 is None:
-                raise ValueError("psycopg2 package not installed")
-            cn = psycopg2.connect(database=dbnm,
-                                  host=config.get('host', None),
-                                  user=config.get('user', None),
-                                  password=config.get('password', None))
+        elif dbtype == "postgresql":
+            if psycopg is None:
+                raise ValueError("psycopg package not installed")
+            cn = psycopg.connect(
+                f'''host={config.get("host","''")} dbname={dbnm} user={config.get("user","''")} password={config.get("password","''")}'''
+            )
+
+    schemaBase = ''
+    lwregSchema = ''
+    if dbtype == 'postgresql':
+        lwregSchema = config.get('lwregSchema', '')
+        if lwregSchema:
+            schemaBase = config['lwregSchema'] + '.'
+    registrationMetadataTableName = schemaBase + _baseregistrationMetadataTableName
+    origDataTableName = schemaBase + _baseorigDataTableName
+    hashTableName = schemaBase + _basehashTableName
+    molblocksTableName = schemaBase + _basemolblocksTableName
+    conformersTableName = schemaBase + _baseconformersTableName
+
     _dbtype = dbtype
     if dbtype == 'postgresql':
         _replace_placeholders = _replace_placeholders_pcts
     else:
         _replace_placeholders = _replace_placeholders_noop
-
+    if _lookupWithDefault(config, "cacheConnection"):
+        _dbConnection = cn
+    else:
+        _dbConnection = None
+    _dbConfig = config
     return cn
+
+
+def _clear_cached_connection():
+    global _dbConnection
+    global _dbConfig
+    _dbConnection = None
+    _dbConfig = None
 
 
 MolTuple = namedtuple('MolTuple', ('mol', 'datatype', 'rawdata'))
@@ -113,16 +277,15 @@ def _process_molblock(molblock, config):
     mol = Chem.MolFromMolBlock(molblock,
                                sanitize=False,
                                removeHs=_lookupWithDefault(config, 'removeHs'))
-    if mol.GetConformer().Is3D() and _lookupWithDefault(
-            config, 'use3DIfPresent'):
-        Chem.AssignStereochemistryFrom3D(mol)
     return mol
 
 
 def _parse_mol(mol=None, molfile=None, molblock=None, smiles=None, config={}):
     if mol is not None:
         datatype = 'pkl'
-        raw = mol.ToBinary(propertyFlags=Chem.PropertyPickleOptions.AllProps)
+        raw = base64.encodebytes(
+            mol.ToBinary(propertyFlags=Chem.PropertyPickleOptions.AllProps))
+        raw = raw.decode()
     elif smiles is not None:
         spp = Chem.SmilesParserParams()
         spp.sanitize = False
@@ -149,11 +312,10 @@ def _parse_mol(mol=None, molfile=None, molblock=None, smiles=None, config={}):
 def _get_standardization_list(config):
     if not config:
         config = _configure()
-    elif type(config) == str:
+    elif isinstance(config, str):
         config = _configure(filename=config)
     sopts = _lookupWithDefault(config, 'standardization')
 
-    res = []
     if type(sopts) not in (list, tuple):
         sopts = (sopts, )
     return tuple(sopts)
@@ -163,7 +325,7 @@ def _get_standardization_label(config):
     sopts = _get_standardization_list(config)
     res = []
     for sopt in sopts:
-        if type(sopt) == str:
+        if isinstance(sopt, str):
             nm = sopt
         elif hasattr(sopt, 'name'):
             nm = sopt.name
@@ -187,14 +349,38 @@ def standardize_mol(mol, config=None):
     Keyword arguments:
     config -- configuration dict
     """
+    if not config:
+        config = _configure()
+    elif isinstance(config, str):
+        config = _configure(filename=config)
+
+    _check_config(config)
+
     sopts = _get_standardization_list(config)
     for sopt in sopts:
-        if type(sopt) == str:
-            sopt = standardizationOptions[sopt]
+        if isinstance(sopt, str):
+            if sopt in standardizationOptions:
+                sopt = standardizationOptions[sopt]
+            else:
+                sopt = getattr(standardization_lib, sopt)()
         mol = sopt(mol)
         if mol is None:
             return None
     return mol
+
+
+def _get_conformer_hash(mol, numDigits, confId=-1):
+    """ returns a hash for a molecule's conformer based on the atomic positions
+    
+    """
+    if not mol.GetNumConformers():
+        return ''
+    ps = mol.GetConformer(id=confId).GetPositions()
+    hps = []
+    for p in ps:
+        coords = [str(round(x, numDigits)) for x in p]
+        hps.append(','.join(coords))
+    return sha256(';'.join(sorted(hps)).encode()).hexdigest()
 
 
 def hash_mol(mol, escape=None, config=None):
@@ -206,15 +392,67 @@ def hash_mol(mol, escape=None, config=None):
     """
     if not config:
         config = _configure()
-    elif type(config) == str:
+    elif isinstance(config, str):
         config = _configure(filename=config)
+
+    _check_config(config)
+
     layers = RegistrationHash.GetMolLayers(
         mol,
         escape=escape,
         enable_tautomer_hash_v2=_lookupWithDefault(config,
                                                    'useTautomerHashv2'))
+
     mhash = RegistrationHash.GetMolHash(layers)
+
     return mhash, layers
+
+
+def _register_one_conformer(mrn,
+                            sMol,
+                            molb,
+                            cn,
+                            curs,
+                            config,
+                            fail_on_duplicate,
+                            confId=-1):
+    try:
+        chash = _get_conformer_hash(sMol,
+                                    _lookupWithDefault(config,
+                                                       "numConformerDigits"),
+                                    confId=confId)
+        regtuple = (mrn, chash, molb)
+        qs = '?,?,?'
+        if _dbtype != 'postgresql':
+            curs.execute(
+                _replace_placeholders(
+                    f'insert into {conformersTableName} values (NULL,{qs})'),
+                regtuple)
+            curs.execute('select last_insert_rowid()')
+            conf_id = curs.fetchone()[0]
+        else:
+            # Note that on postgresql the serial ids are increasing, but not sequential
+            #  i.e. failed inserts will increment the counter
+            curs.execute(
+                _replace_placeholders(
+                    f'insert into {conformersTableName} values (default,{qs}) returning conf_id'
+                ), regtuple)
+            conf_id = curs.fetchone()[0]
+        cn.commit()
+    except _violations:
+        cn.rollback()
+        if fail_on_duplicate:
+            raise
+        else:
+            curs.execute(
+                _replace_placeholders(
+                    f'select conf_id from {conformersTableName} where conformer_hash=?'
+                ), (chash, ))
+            conf_id = curs.fetchone()[0]
+    except:
+        cn.rollback()
+        raise
+    return conf_id
 
 
 def _register_mol(tpl,
@@ -222,14 +460,28 @@ def _register_mol(tpl,
                   cn,
                   curs,
                   config,
-                  failOnDuplicate,
+                  fail_on_duplicate,
                   def_rdkit_version_label=None,
-                  def_std_label=None):
+                  def_std_label=None,
+                  confId=-1,
+                  molCache=None):
     """ does the work of registering one molecule """
+    registerConformers = _lookupWithDefault(config, "registerConformers")
+
+    if registerConformers and tpl.mol is not None \
+        and not tpl.mol.GetNumConformers():
+        raise ValueError(
+            "attempt to register a molecule without conformers when registerConformers is set"
+        )
+
+    if hasattr(cn, 'autocommit') and cn.autocommit is True:
+        logging.warn("setting autocommit on the database connection to False")
+        cn.autocommit = False
+
     standardization_label = _get_standardization_label(config)
     if def_std_label is None:
         curs.execute(
-            "select value from registration_metadata where key='standardization'"
+            f"select value from {registrationMetadataTableName} where key='standardization'"
         )
         def_std_label = curs.fetchone()[0]
     if standardization_label == def_std_label:
@@ -237,31 +489,42 @@ def _register_mol(tpl,
 
     if def_rdkit_version_label is None:
         curs.execute(
-            "select value from registration_metadata where key='rdkitVersion'")
+            f"select value from {registrationMetadataTableName} where key='rdkitVersion'"
+        )
         def_rdkit_version_label = curs.fetchone()[0]
     rdkit_version_label = rdkit.__version__
     if rdkit_version_label == def_rdkit_version_label:
         rdkit_version_label = None
+    mrn = None
+    conf_id = None
     try:
         sMol = standardize_mol(tpl.mol, config=config)
+        if confId != -1:
+            Chem.AssignStereochemistryFrom3D(sMol, confId)
         if sMol is None:
-            return None
-        molb = Chem.MolToV3KMolBlock(sMol)
+            return None, None
+        try:
+            molb = Chem.MolToV3KMolBlock(sMol, confId=confId)
+        except KekulizeException:
+            return None, None
 
         mhash, layers = hash_mol(sMol, escape=escape, config=config)
 
-        regtuple = (mhash, layers[HashLayer.FORMULA],
-                    layers[HashLayer.CANONICAL_SMILES],
-                    layers[HashLayer.NO_STEREO_SMILES],
-                    layers[HashLayer.TAUTOMER_HASH],
-                    layers[HashLayer.NO_STEREO_TAUTOMER_HASH],
-                    layers[HashLayer.ESCAPE], layers[HashLayer.SGROUP_DATA],
-                    rdkit_version_label)
+        regtuple = [mhash] + [
+            layers[HashLayer.FORMULA], layers[HashLayer.CANONICAL_SMILES],
+            layers[HashLayer.NO_STEREO_SMILES],
+            layers[HashLayer.TAUTOMER_HASH],
+            layers[HashLayer.NO_STEREO_TAUTOMER_HASH],
+            layers[HashLayer.ESCAPE], layers[HashLayer.SGROUP_DATA]
+        ]
+        regtuple.append(rdkit_version_label)
+        regtuple = tuple(regtuple)
+        qs = ','.join('?' * len(regtuple))
         # will fail if the fullhash is already there
         if _dbtype != 'postgresql':
             curs.execute(
                 _replace_placeholders(
-                    'insert into hashes values (NULL,?,?,?,?,?,?,?,?,?)'),
+                    f'insert into {hashTableName} values (NULL,{qs})'),
                 regtuple)
             curs.execute('select last_insert_rowid()')
             mrn = curs.fetchone()[0]
@@ -270,31 +533,48 @@ def _register_mol(tpl,
             #  i.e. failed inserts will increment the counter
             curs.execute(
                 _replace_placeholders(
-                    'insert into hashes values (default,?,?,?,?,?,?,?,?,?) returning molregno'
+                    f'insert into {hashTableName} values (default,{qs}) returning molregno'
                 ), regtuple)
             mrn = curs.fetchone()[0]
 
         curs.execute(
-            _replace_placeholders('insert into orig_data values (?, ?, ?)'),
-            (mrn, tpl.rawdata, tpl.datatype))
+            _replace_placeholders(
+                f'insert into {origDataTableName} (molregno, data, datatype) values (?, ?, ?)'
+            ), (mrn, tpl.rawdata, tpl.datatype))
         curs.execute(
-            _replace_placeholders('insert into molblocks values (?, ?, ?)'),
+            _replace_placeholders(
+                f'insert into {molblocksTableName} values (?, ?, ?)'),
             (mrn, molb, standardization_label))
 
         cn.commit()
     except _violations:
         cn.rollback()
-        if failOnDuplicate:
+        if fail_on_duplicate and not (registerConformers
+                                      and sMol.GetNumConformers()):
             raise
         else:
             curs.execute(
                 _replace_placeholders(
-                    'select molregno from hashes where fullhash=?'), (mhash, ))
+                    f'select molregno from {hashTableName} where fullhash=?'),
+                (mhash, ))
             mrn = curs.fetchone()[0]
     except:
         cn.rollback()
         raise
-    return mrn
+
+    if molCache is not None:
+        molCache.append(sMol)
+    if registerConformers and sMol.GetNumConformers():
+        conf_id = _register_one_conformer(mrn,
+                                          sMol,
+                                          molb,
+                                          cn,
+                                          curs,
+                                          config,
+                                          fail_on_duplicate,
+                                          confId=confId)
+
+    return mrn, conf_id
 
 
 def _get_delimiter(smilesfile):
@@ -361,192 +641,418 @@ def register(config=None,
              smiles=None,
              escape=None,
              fail_on_duplicate=True,
+             confId=-1,
              no_verbose=True):
-    """ registers a new molecule, assuming it doesn't already exist,
-    and returns the new registry number (molregno)
-    
-    only one of the molecule format objects should be provided
-
-    Keyword arguments:
-    config     -- configuration dict
-    mol        -- RDKit molecule object
-    molfile    -- MOL or SDF filename
-    molblock   -- MOL or SDF block
-    smiles     -- smiles
-    escape     -- the escape layer
-    failOnDuplicate -- if true then an exception is raised when trying to register a duplicate
-    no_verbose -- if this is False then the registry number will be printed
     """
+    Registers a new molecule, assuming it doesn't already exist, and returns the new registry number (molregno).
+
+    Only one of the molecule format objects should be provided.
+
+    :param config: Configuration dictionary or filename.
+    :param mol: RDKit molecule object.
+    :param molfile: MOL or SDF filename.
+    :param molblock: MOL or SDF block.
+    :param smiles: SMILES string.
+    :param escape: The escape layer.
+    :param fail_on_duplicate: If True, an exception is raised when trying to register a duplicate.
+    :param confId: The conformer ID to use when in registerConformers mode.
+    :param no_verbose: If False, the registry number will be printed.
+    :return: The new registry number (molregno) or a tuple of (molregno, conf_id) if registerConformers mode is enabled.
+    :raises RegistrationFailureReasons.PARSE_FAILURE: If molecule parsing fails.
+    :raises RegistrationFailureReasons.FILTERED: If molecule is filtered out.
+    """
+
     if not config:
         config = _configure()
-    elif type(config) == str:
+    elif isinstance(config, str):
         config = _configure(filename=config)
+
+    _check_config(config)
+
     tpl = _parse_mol(mol=mol,
                      molfile=molfile,
                      molblock=molblock,
                      smiles=smiles,
                      config=config)
 
-    cn = _connect(config)
+    cn = connect(config)
     curs = cn.cursor()
     if tpl.mol is None:
         return RegistrationFailureReasons.PARSE_FAILURE
 
-    mrn = _register_mol(tpl, escape, cn, curs, config, fail_on_duplicate)
+    mrn, conf_id = _register_mol(tpl,
+                                 escape,
+                                 cn,
+                                 curs,
+                                 config,
+                                 fail_on_duplicate,
+                                 confId=confId)
     if mrn is None:
         return RegistrationFailureReasons.FILTERED
+    if not _lookupWithDefault(config, "registerConformers"):
+        res = mrn
+    else:
+        res = mrn, conf_id
     if not no_verbose:
-        print(mrn)
-    return mrn
+        print(res)
+    return res
+
+
+def register_multiple_conformers(config=None,
+                                 mol=None,
+                                 escape=None,
+                                 fail_on_duplicate=True,
+                                 no_verbose=True):
+    """ Registers all of the conformers of a multi-conformer molecule
+    Using this function only makes sense when registerConformers is enabled.
+    
+    :param config: Configuration dictionary or filename.
+    :param mol: RDKit molecule object (must have at least one conformer).
+    :param escape: The escape layer.
+    :param fail_on_duplicate: If True, an exception is raised when trying to register a duplicate.
+    :param no_verbose: If False, the registry number will be printed.
+    :return: A tuple of (molregno, conf_id) for each conformer registered.
+
+    """
+    if not config:
+        config = _configure()
+    elif isinstance(config, str):
+        config = _configure(filename=config)
+
+    _check_config(config)
+    if not _lookupWithDefault(config, "registerConformers"):
+        raise ValueError(
+            'register_multiple_conformers can only be used when registerConformers is enabled'
+        )
+
+    tpl = _parse_mol(mol=mol, config=config)
+    if tpl.mol is None:
+        return RegistrationFailureReasons.PARSE_FAILURE
+
+    cn = connect(config)
+    curs = cn.cursor()
+
+    # start by registering the first conformer in order to
+    # get the molregno that we'll use later
+    rc = []
+    mrns = {}
+    confsDone = set()
+    confMrns = []
+    res = []
+    for i, conf in enumerate(tpl.mol.GetConformers()):
+        Chem.AssignStereochemistryFrom3D(tpl.mol, conf.GetId())
+        smi = Chem.MolToSmiles(tpl.mol)
+        if smi not in mrns:
+            mrn, conf_id = _register_mol(tpl,
+                                         escape,
+                                         cn,
+                                         curs,
+                                         config,
+                                         fail_on_duplicate,
+                                         confId=conf.GetId(),
+                                         molCache=rc)
+            if mrn is not None:
+                mrns[smi] = mrn
+                confsDone.add(i)
+                res.append((mrn, conf_id))
+        else:
+            mrn = mrns[smi]
+        confMrns.append(mrn)
+    if not len(res):
+        return RegistrationFailureReasons.FILTERED
+
+    sMol = rc[0]
+    for i, conf in enumerate(sMol.GetConformers()):
+        if i in confsDone:
+            # we already registered the first conformer
+            continue
+        molb = Chem.MolToV3KMolBlock(sMol, confId=conf.GetId())
+        mrn = confMrns[i]
+        conf_id = _register_one_conformer(mrn,
+                                          sMol,
+                                          molb,
+                                          cn,
+                                          curs,
+                                          config,
+                                          fail_on_duplicate,
+                                          confId=conf.GetId())
+        res.append((mrn, conf_id))
+    if not no_verbose:
+        print(res)
+    return tuple(res)
 
 
 def bulk_register(config=None,
                   mols=None,
                   sdfile=None,
                   smilesfile=None,
-                  escapeProperty=None,
-                  failOnDuplicate=True,
-                  no_verbose=True):
-    """ registers multiple new molecules, assuming they don't already exist,
-    and returns the new registry numbers (molregno)
-    
-    The result tuple includes a single entry for each molecule in the input.
-    That entry can be one of the following:
-      - the registry number (molregno) of the registered molecule
-      - RegistrationFailureReasons.DUPLICATE if failOnDuplicate is True and a
-        molecule is a duplicate
-      - RegistrationFalureReasons.PARSE_FAILURE if there was a problem processing
-        the molecule 
-    
-    only one of the molecule format objects should be provided
-
-    Keyword arguments:
-    config         -- configuration dict
-    mols           -- an iterable of RDKit molecule objects
-    sdfile         -- SDF filename
-    escapeProperty -- the molecule property to use as the escape layer
-    failOnDuplicate -- if true then RegistraionFailureReasons.DUPLICATE will be returned 
-                       for each already-registered molecule, otherwise the already existing
-                       structure ID will be returned
-    no_verbose     -- if this is False then the registry numbers will be printed
+                  escape_property=None,
+                  fail_on_duplicate=True,
+                  no_verbose=True,
+                  show_progress=False):
     """
+    Registers multiple new molecules, assuming they don't already exist, and returns the new registry numbers (molregno). 
+    ``RegistrationFailureReasons.DUPLICATE`` if ``fail_on_duplicate`` is True and a molecule is a duplicate ``RegistrationFailureReasons.PARSE_FAILURE`` if there was a problem processing the molecule. 
+    
+    Only one of the molecule format objects should be provided.
+    
+    :param config: Configuration dict or filename.
+    :param mols: An iterable of RDKit molecule objects.
+    :param sdfile: SDF filename.
+    :param smilesfile: SMILES filename.
+    :param escape_property: The molecule property to use as the escape layer.
+    :param fail_on_duplicate: If True, then ``RegistrationFailureReasons.DUPLICATE`` will be returned for each already-registered molecule, otherwise the already existing structure ID will be returned.
+    :param no_verbose: If False, then the registry numbers will be printed.
+    :param show_progress: If True, then a progress bar will be shown for the molecules.
+    :return: A tuple containing the registry numbers or failure reasons for each molecule.
+    """
+
+    if not config:
+        config = _configure()
+    elif isinstance(config, str):
+        config = _configure(filename=config)
 
     if mols:
         pass
     elif sdfile:
-        mols = Chem.ForwardSDMolSupplier(sdfile)
+        mols = Chem.ForwardSDMolSupplier(sdfile,
+                                         removeHs=_lookupWithDefault(
+                                             config, 'removeHs'))
     elif smilesfile:
         mols = _get_mols_from_smilesfile(smilesfile)
     else:
         raise ValueError('No input molecules provided!')
 
-    if not config:
-        config = _configure()
-    elif type(config) == str:
-        config = _configure(filename=config)
-    mrns = []
-    cn = _connect(config)
+    _check_config(config)
+
+    res = []
+    cn = connect(config)
     curs = cn.cursor()
 
     curs.execute(
-        "select value from registration_metadata where key='standardization'")
+        f"select value from {registrationMetadataTableName} where key='standardization'"
+    )
     def_std_label = curs.fetchone()[0]
     curs.execute(
-        "select value from registration_metadata where key='rdkitVersion'")
+        f"select value from {registrationMetadataTableName} where key='rdkitVersion'"
+    )
     def_rdkit_version_label = curs.fetchone()[0]
-
-    for mol in mols:
+    for mol in tqdm(mols, disable=not show_progress):
         if mol is None:
-            mrns.append(RegistrationFailureReasons.PARSE_FAILURE)
+            res.append(RegistrationFailureReasons.PARSE_FAILURE)
             continue
         tpl = _parse_mol(mol=mol, config=config)
         try:
-            if escapeProperty is not None and mol.HasProp(escapeProperty):
-                escape = mol.GetProp(escapeProperty)
+            if escape_property is not None and mol.HasProp(escape_property):
+                escape = mol.GetProp(escape_property)
             else:
                 escape = None
-            mrn = _register_mol(
+            mrn, conf_id = _register_mol(
                 tpl,
                 escape,
                 cn,
                 curs,
                 config,
-                failOnDuplicate,
+                fail_on_duplicate,
                 def_rdkit_version_label=def_rdkit_version_label,
                 def_std_label=def_std_label)
 
             if mrn is None:
                 mrn = RegistrationFailureReasons.FILTERED
-            mrns.append(mrn)
+
+            if not _lookupWithDefault(config, "registerConformers"):
+                res.append(mrn)
+            else:
+                res.append((mrn, conf_id))
         except _violations:
-            mrns.append(RegistrationFailureReasons.DUPLICATE)
+            res.append(RegistrationFailureReasons.DUPLICATE)
     if not no_verbose:
-        print(mrns)
-    return tuple(mrns)
+        print(res)
+    return tuple(res)
+
+
+def _getConfIdsForMolregnos(ids, config):
+    assert _lookupWithDefault(config, "registerConformers")
+
+    cn = connect(config)
+    curs = cn.cursor()
+
+    qs = _replace_placeholders(','.join('?' * len(ids)))
+    curs.execute(
+        f'select molregno,conf_id from {conformersTableName} where molregno in ({qs})',
+        ids)
+    res = curs.fetchall()
+    return res
+
+
+def registration_counts(config=None):
+    """ Returns the number of entries in the registration database
+
+    the result is the number of molecules if registerConformers is not set,
+    and a tuple of (number of molecules, number of conformers) if it is
+
+    :param config: Configuration dictionary.
+    :return: either the number of molecule in the database or a 2-tuple withe (number of molecules, number of conformers).
+    """
+    if not config:
+        config = _configure()
+    elif isinstance(config, str):
+        config = _configure(filename=config)
+
+    cn = connect(config)
+    curs = cn.cursor()
+    curs.execute(f'select count(*) from {hashTableName}')
+    nHashes = curs.fetchone()[0]
+    ret = nHashes
+
+    if _lookupWithDefault(config, "registerConformers"):
+        curs.execute(f'select count(*) from {conformersTableName}')
+        nConfs = curs.fetchone()[0]
+        ret = nHashes, nConfs
+
+    return ret
+
+
+def get_all_identifiers(config=None):
+    """
+    Returns a tuple with all of the identifiers in the database.
+    If in molecule mode, it returns a tuple with all of the molregnos in the database.
+    If in conformer mode, it returns a tuple of all (molregno, conf_id) tuples in the database.
+
+    :param config: Configuration dictionary.
+    :return: A tuple with all of the identifiers in the database.
+    """
+    if not config:
+        config = _configure()
+    elif isinstance(config, str):
+        config = _configure(filename=config)
+
+    if _lookupWithDefault(config, "registerConformers"):
+        cn = connect(config)
+        curs = cn.cursor()
+        curs.execute(f'select molregno, conf_id from {conformersTableName}')
+        res = curs.fetchall()
+        return tuple(sorted((x[0], x[1]) for x in res))
+    else:
+        cn = connect(config)
+        curs = cn.cursor()
+        curs.execute(f'select molregno from {hashTableName}')
+        res = curs.fetchall()
+        return tuple(sorted(x[0] for x in res))
+
+
+def get_all_registry_numbers(config=None):
+    """
+    Returns a tuple with all of the registry numbers (molregnos) in the database.
+
+    :param config: Configuration dictionary.
+    :return: A tuple with all of the registry numbers (molregnos) in the database.
+    """
+    warnings.warn(
+        "get_all_registry_numbers() is deprecated and will be removed in a future version. "
+        "Use get_all_identifiers() instead.",
+        DeprecationWarning,
+        stacklevel=2)
+    if not config:
+        config = _configure()
+    elif isinstance(config, str):
+        config = _configure(filename=config)
+
+    cn = connect(config)
+    curs = cn.cursor()
+    curs.execute(f'select molregno from {hashTableName}')
+    res = curs.fetchall()
+    return tuple(sorted(x[0] for x in res))
 
 
 def query(config=None,
           layers='ALL',
+          ids=None,
           mol=None,
           molfile=None,
           molblock=None,
           smiles=None,
           escape=None,
           no_verbose=True):
-    """ queries to see if a molecule has already been registered,
-    and returns the corresponding registry numbers (molregnos)
+    """
+    Queries to see if a molecule has already been registered, and returns the corresponding registry numbers.
+    Only one of the molecule format objects should be provided.
     
-    only one of the molecule format objects should be provided
-
-    Keyword arguments:
-    config     -- configuration dict
-    layers     -- hash layers to be used to determine identity
-    mol        -- RDKit molecule object
-    molfile    -- MOL or SDF filename
-    molblock   -- MOL or SDF block
-    smiles     -- smiles
-    escape     -- the escape layer
-    no_verbose -- if this is False then the registry numbers will be printed
+    :param config: Configuration dict or filename.
+    :param layers: Hash layers to be used to determine identity. 
+    :param ids: List or tuple of molregnos. Only makes sense if registerConformers is set,
+                in which case this will return all conf_ids for the molregnos in the ids list
+                as a list of (molregno, conf_id) tuples.
+    :param mol: RDKit molecule object.
+    :param molfile: MOL or SDF filename.
+    :param molblock: MOL or SDF block.
+    :param smiles: SMILES string.
+    :param escape: The escape layer.
+    :param no_verbose: If False, the registry numbers will be printed.
+    :raises ValueError: If ids are provided but registerConformers is not enabled.
+    :return: List of registry numbers or list of (molregno, conf_id) tuples.
     """
     if not config:
         config = _configure()
-    elif type(config) == str:
+    elif isinstance(config, str):
         config = _configure(filename=config)
 
-    tpl = _parse_mol(mol=mol,
-                     molfile=molfile,
-                     molblock=molblock,
-                     smiles=smiles,
-                     config=config)
-    sMol = standardize_mol(tpl.mol, config=config)
-    mhash, hlayers = hash_mol(sMol, escape=escape, config=config)
+    _check_config(config)
 
-    cn = _connect(config)
-    curs = cn.cursor()
-    if layers == 'ALL':
-        curs.execute(
-            _replace_placeholders(
-                'select molregno from hashes where fullhash=?'), (mhash, ))
+    if ids is not None:
+        if not _lookupWithDefault(config, "registerConformers"):
+            raise ValueError(
+                'passing ids to query() only makes sense when registerConformers is enabled'
+            )
+        res = _getConfIdsForMolregnos(ids, config=config)
     else:
-        vals = []
-        query = []
-        if type(layers) == str:
-            layers = layers.upper().split(',')
-        if not hasattr(layers, '__len__'):
-            layers = [layers]
-        for lyr in layers:
-            if type(lyr) == str:
-                k = getattr(HashLayer, lyr)
+        tpl = _parse_mol(mol=mol,
+                         molfile=molfile,
+                         molblock=molblock,
+                         smiles=smiles,
+                         config=config)
+        sMol = standardize_mol(tpl.mol, config=config)
+
+        cn = connect(config)
+        curs = cn.cursor()
+        if not _lookupWithDefault(config, "registerConformers") or \
+           not sMol.GetNumConformers():
+            mhash, hlayers = hash_mol(sMol, escape=escape, config=config)
+            if layers == 'ALL':
+                queryText = _replace_placeholders(
+                    f'select molregno from {hashTableName} where fullhash=?')
+                queryVals = (mhash, )
             else:
-                k = lyr
-                lyr = str(lyr).split('.')[-1]
-            vals.append(hlayers[k])
-            query.append(f'"{lyr}"=?')
+                vals = []
+                query = []
+                if isinstance(layers, str):
+                    layers = layers.upper().split(',')
+                if not hasattr(layers, '__len__'):
+                    layers = [layers]
+                for lyr in layers:
+                    if isinstance(lyr, str):
+                        k = getattr(HashLayer, lyr)
+                    else:
+                        k = lyr
+                        lyr = str(lyr).split('.')[-1]
+                    vals.append(hlayers[k])
+                    query.append(f'"{lyr}"=?')
 
-        query = _replace_placeholders(' and '.join(query))
-        curs.execute(f'select molregno from hashes where {query}', vals)
+                query = _replace_placeholders(' and '.join(query))
+                queryText = f'select molregno from {hashTableName} where {query}'
+                queryVals = vals
+            curs.execute(queryText, queryVals)
+            res = [x[0] for x in curs.fetchall()]
+        else:
+            # do a conformer query
+            chash = _get_conformer_hash(
+                sMol, _lookupWithDefault(config, "numConformerDigits"))
+            curs.execute(
+                _replace_placeholders(
+                    f'select molregno,conf_id from {conformersTableName} where conformer_hash=?'
+                ), (chash, ))
+            res = [tuple(x) for x in curs.fetchall()]
 
-    res = [x[0] for x in curs.fetchall()]
     if not no_verbose:
         if res:
             print(' '.join(str(x) for x in res))
@@ -556,41 +1062,94 @@ def query(config=None,
     return res
 
 
+def _parsePickleFromDB(data):
+    # there was a bug in early versions of the code that stored the binary data really badly
+    if data[:2] == r'\x':
+        byts = []
+        for i in range(2, len(data), 2):
+            byts.append(int(data[i:i + 2], base=16))
+        data = bytes(byts)
+    else:
+        data = base64.decodebytes(data.encode())
+    return data
+
+
 def retrieve(config=None,
              ids=None,
              id=None,
              as_submitted=False,
+             as_hashes=False,
              no_verbose=True):
-    """ returns the molecule data for one or more registry ids (molregnos)
-    The return value is a tuple of (molregno, data, format) 3-tuples    
-
-
-    only one of id or ids should be provided
-
-    Keyword arguments:
-    config       -- configuration dict
-    ids          -- an iterable of registry ids (molregnos)
-    id           -- a registry id (molregno)
-    as_submitted -- if True, then the structure will be returned as registered
-    no_verbose   -- if this is False then the registry number will be printed
     """
+    Returns the molecule data for one or more registry ids (molregnos).
+
+    The return value is a dictionary of (data, format) 2-tuples with molregnos as keys.
+
+    Only one of id or ids should be provided.
+
+    If registerConformers is set, the conformers can be retrieved by providing
+    the tuples of (molregno, conf_id) and the return value will be a dictionary
+    of (data, 'mol') 2-tuples with (molregno, conf_id) tuples as keys.
+
+    :param dict config: Configuration dictionary.
+    :param list ids: An iterable of registry ids (molregnos).
+    :param int id: A registry id (molregno).
+    :param bool as_submitted: If True, then the structure will be returned as registered.
+    :param bool as_hashes: If True, then the hashes will be returned (as a dict) instead of the structures.
+    :param bool no_verbose: If this is False, then the registry number will be printed.
+    :return: A dictionary of (data, format) 2-tuples with molregnos as keys.
+    """
+
     if not config:
         config = _configure()
-    elif type(config) == str:
+    elif isinstance(config, str):
         config = _configure(filename=config)
+
+    _check_config(config)
+
+    registerConformers = _lookupWithDefault(config, "registerConformers")
+
     if id is not None:
-        ids = [int(id)]
-    if ids is not None:
-        if type(ids) == str:
-            ids = [int(x) for x in ids.split(',')]
-    cn = _connect(config)
+        if registerConformers:
+            try:
+                ids = [(int(id[0]), int(id[1]))]
+                getConfs = True
+            except TypeError:
+                ids = [int(id)]
+                getConfs = False
+        else:
+            ids = [int(id)]
+            getConfs = False
+    elif ids is not None:
+        if registerConformers:
+            try:
+                ids = [(int(x), int(y)) for x, y in ids]
+                getConfs = True
+            except TypeError:
+                ids = [int(x) for x in ids]
+                getConfs = False
+        else:
+            if isinstance(ids, str):
+                ids = [int(x) for x in ids.split(',')]
+            getConfs = False
+
+    cn = connect(config)
     curs = cn.cursor()
-    if as_submitted:
-        qry = 'molregno,data,datatype from orig_data'
+    if not getConfs:
+        if as_hashes:
+            qry = f'* from {hashTableName}'
+        elif as_submitted:
+            qry = f'molregno,data,datatype from {origDataTableName}'
+        else:
+            qry = f"molregno,molblock,'mol' from {molblocksTableName}"
+        qs = _replace_placeholders(','.join('?' * len(ids)))
+        curs.execute(f'select {qry} where molregno in ({qs})', ids)
     else:
-        qry = "molregno,molblock,'mol' from molblocks"
-    qs = _replace_placeholders(','.join('?' * len(ids)))
-    curs.execute(f'select {qry} where molregno in ({qs})', ids)
+        qry = f"molregno,conf_id,molblock from {conformersTableName}"
+        qs = _replace_placeholders(','.join('?' * len(ids)))
+        curs.execute(
+            f'select {qry} where molregno in ({qs}) and conf_id in ({qs})',
+            ([x for x, y in ids] + [y for x, y in ids]))
 
     res = curs.fetchall()
     if not no_verbose:
@@ -599,26 +1158,52 @@ def retrieve(config=None,
                 print(entry)
         else:
             print('not found')
-
-    return tuple(res)
+    resDict = {}
+    if as_hashes:
+        colns = [x[0] for x in curs.description]
+        for row in res:
+            rowd = {}
+            for i, coln in enumerate(colns):
+                if coln == 'rdkitversion':
+                    continue
+                if coln == 'molregno':
+                    mrn = row[i]
+                    continue
+                if row[i] is None:
+                    continue
+                rowd[coln] = row[i]
+            resDict[mrn] = rowd
+    else:
+        if not getConfs:
+            for mrn, data, fmt in res:
+                if as_submitted and fmt == 'pkl':
+                    data = _parsePickleFromDB(data)
+                resDict[mrn] = (data, fmt)
+        else:
+            for mrn, confId, molb in res:
+                resDict[(mrn, confId)] = (molb, 'mol')
+    return resDict
 
 
 def _registerMetadata(curs, config):
     dc = defaultConfig()
     dc.update(config)
+    dc['standardization'] = _get_standardization_label(dc)
     for k, v in dc.items():
+        if k in ('connection', 'user', 'password', 'cacheConnection'):
+            continue
         curs.execute(
             _replace_placeholders(
-                'insert into registration_metadata values (?,?)'),
+                f'insert into {registrationMetadataTableName} values (?,?)'),
             (str(k), str(v)))
 
     curs.execute(
         _replace_placeholders(
-            'insert into registration_metadata values (?,?)'),
+            f'insert into {registrationMetadataTableName} values (?,?)'),
         ('rdkitVersion', rdkit.__version__))
 
 
-def initdb(config=None, confirm=False):
+def _initdb(config=None, confirm=False):
     """ initializes the registration database    
 
     NOTE that this call destroys any existing information in the registration database
@@ -631,35 +1216,114 @@ def initdb(config=None, confirm=False):
         return
     if not config:
         config = _configure()
-    elif type(config) == str:
+    elif isinstance(config, str):
         config = _configure(filename=config)
-    cn = _connect(config)
+
+    _check_config(config)
+
+    cn = connect(config)
     curs = cn.cursor()
 
-    curs.execute('drop table if exists registration_metadata')
-    curs.execute('create table registration_metadata (key text, value text)')
+    if lwregSchema and _dbtype == 'postgresql':
+        curs.execute(f'create schema if not exists {lwregSchema}')
+    curs.execute(f'drop table if exists {registrationMetadataTableName}')
+    curs.execute(
+        f'create table {registrationMetadataTableName} (key text, value text)')
     _registerMetadata(curs, config)
+    cn.commit()
 
-    curs.execute('drop table if exists hashes')
+    if _dbtype != 'postgresql':
+        curs.execute(f'drop table if exists {hashTableName}')
+    else:
+        curs.execute(f'drop table if exists {hashTableName} cascade')
     if _dbtype != 'postgresql':
         curs.execute(
-            '''create table hashes (molregno integer primary key, fullhash text unique, 
+            f'''create table {hashTableName} (molregno integer primary key, fullhash text unique, 
             formula text, canonical_smiles text, no_stereo_smiles text, 
             tautomer_hash text, no_stereo_tautomer_hash text, "escape" text, sgroup_data text, rdkitVersion text)'''
+        )
+        curs.execute(
+            f'''create unique index {hashTableName}_fullhash_idx on {hashTableName} 
+                (fullhash)''')
+    else:
+        curs.execute(
+            f'''create table {hashTableName} (molregno serial primary key, fullhash text unique, 
+            formula text, canonical_smiles text, no_stereo_smiles text, 
+            tautomer_hash text, no_stereo_tautomer_hash text, "escape" text, sgroup_data text, rdkitVersion text)'''
+        )
+        curs.execute(
+            f'''create index {hashTableName.replace(".","_")}_fullhash_idx on {hashTableName} 
+                using hash(fullhash)''')
+    curs.execute(f'drop table if exists {origDataTableName}')
+    if _dbtype != 'postgresql':
+        curs.execute(
+            f'create table {origDataTableName} (molregno integer unique not null, data text, datatype text, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP, foreign key(molregno) references {hashTableName} (molregno))'
         )
     else:
         curs.execute(
-            '''create table hashes (molregno serial primary key, fullhash text unique, 
-            formula text, canonical_smiles text, no_stereo_smiles text, 
-            tautomer_hash text, no_stereo_tautomer_hash text, "escape" text, sgroup_data text, rdkitVersion text)'''
+            f'create table {origDataTableName} (molregno integer unique not null references {hashTableName} (molregno), data text, datatype text, timestamp TIMESTAMP default now())'
         )
-    curs.execute('drop table if exists orig_data')
+    curs.execute(f'drop table if exists {molblocksTableName}')
     curs.execute(
-        'create table orig_data (molregno integer primary key, data text, datatype text)'
+        f'create table {molblocksTableName} (molregno integer unique not null references {hashTableName} (molregno), molblock text, standardization text, foreign key(molregno) references {hashTableName} (molregno))'
     )
-    curs.execute('drop table if exists molblocks')
-    curs.execute(
-        'create table molblocks (molregno integer primary key, molblock text, standardization text)'
-    )
+
+    curs.execute(f'drop table if exists {conformersTableName}')
+    if _lookupWithDefault(config, "registerConformers"):
+        if _dbtype != 'postgresql':
+            curs.execute(
+                f'''create table {conformersTableName} (conf_id integer primary key, molregno integer not null, 
+                   conformer_hash text not null unique, molblock text, foreign key(molregno) references {hashTableName} (molregno))'''
+            )
+            curs.execute(
+                f'''create unique index {conformersTableName}_hash_idx on {conformersTableName} 
+                    (conformer_hash)''')
+        else:
+            curs.execute(
+                f'''create table {conformersTableName} (conf_id serial primary key, molregno integer references {hashTableName} (molregno), 
+                   conformer_hash text not null unique, molblock text)''')
+            curs.execute(
+                f'''create index {conformersTableName.replace(".","_")}_hash_idx on {conformersTableName} 
+                    using hash(conformer_hash)''')
+
     cn.commit()
     return True
+
+
+def initdb(config=None):
+    """
+    Initializes the registration database.
+    
+    You will be prompted to confirm this action since this call will destroy any 
+    existing information in the registration database.
+
+    :param config: Configuration dictionary, defaults to None.
+    :return: Returns the result of the _initdb function if confirmed, otherwise False.
+    """
+    print(
+        "This will destroy any existing information in the registration database."
+    )
+    response = input("  are you sure? [yes/no]: ")
+    if response == 'yes':
+        return _initdb(config=config, confirm=True)
+    print("cancelled")
+    return False
+
+
+def _check_config(config):
+    ''' checks that the configuration is valid and no forbidden combinations are present
+        
+        Selected options in the configuration dict are checked against a list of
+        forbidden combinations. If any of the combinations are present a ValueError
+        is raised.
+
+    '''
+
+    if not config:
+        config = _configure()
+    elif isinstance(config, str):
+        config = _configure(filename=config)
+
+    if config.get("dbtype", "sqlite3") not in ('sqlite3', 'postgresql'):
+        raise ValueError(
+            "Possible values for dbtype are sqlite3 and postgresql")

@@ -1,5 +1,10 @@
 # LWReg: a lightweight chemical registration system
 
+[![Lwreg](https://img.shields.io/badge/DOI-10.1021/acs.jcim.3c00800-blue)](https://pubs.acs.org/doi/10.1021/acs.jcim.4c01133)
+[![ReadTheDocs](https://readthedocs.org/projects/docs/badge/?version=latest)](https://lightweight-registration.readthedocs.io/en/)
+[![RDKit](https://img.shields.io/badge/Powered%20by-RDKit-3838ff.svg?logo=data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQBAMAAADt3eJSAAAABGdBTUEAALGPC/xhBQAAACBjSFJNAAB6JgAAgIQAAPoAAACA6AAAdTAAAOpgAAA6mAAAF3CculE8AAAAFVBMVEXc3NwUFP8UPP9kZP+MjP+0tP////9ZXZotAAAAAXRSTlMAQObYZgAAAAFiS0dEBmFmuH0AAAAHdElNRQfmAwsPGi+MyC9RAAAAQElEQVQI12NgQABGQUEBMENISUkRLKBsbGwEEhIyBgJFsICLC0iIUdnExcUZwnANQWfApKCK4doRBsKtQFgKAQC5Ww1JEHSEkAAAACV0RVh0ZGF0ZTpjcmVhdGUAMjAyMi0wMy0xMVQxNToyNjo0NyswMDowMDzr2J4AAAAldEVYdGRhdGU6bW9kaWZ5ADIwMjItMDMtMTFUMTU6MjY6NDcrMDA6MDBNtmAiAAAAAElFTkSuQmCC)](https://www.rdkit.org/)
+![TOC Image](https://github.com/rinikerlab/lightweight-registration/blob/main/Lwreg.png)
+
 This provides a basic registration system which can be used either as a python
 library or via a command-line interface.
 
@@ -9,34 +14,42 @@ Basic operations:
 - `query`: takes a molecule as input and checks whether or not a matching molecule is registered. returns molregnos (registry IDs) of the matching molecule(s), if any
 - `retrieve`: takes one or more IDs and returns the registered structures for them
 
-## Installation for non-experts:
+## Publications
 
-Please look at the INSTALL.md file.
+[1] J. Chem. Inf. Model. 2024, 64, 16, 6247–6252 : https://pubs.acs.org/doi/10.1021/acs.jcim.4c01133
 
-## Dependencies:
-- rdkit v2023.03.1 or later
-- click
-- psycopg2 (only if you want to use a postgresql database)
+## Documentation
 
-## Installation for experts:
-After installing the dependencies (above) and checking out this repo, run this command in this directory:
+Our full documentation: https://lightweight-registration.readthedocs.io/en/
+
+## Quick-start
+
+Assuming that you have conda (or mamba or something equivalent) installed you can install lwreg directly from this github repo by first creating a conda environment with all the dependencies installed:
 ```
-pip install --editable .
+% conda env create --name py313_lwreg --file=https://raw.githubusercontent.com/rinikerlab/lightweight-registration/main/environment.yml
 ```
-
-## Run in Docker
-```shell
-docker build -t lwreg .
-
-# Run Jupyter notebook on the docker container
-docker run -i -t -p 8888:8888 rdkit-lwreg /bin/bash -c "\
-    apt update && apt install libtiff5 -y && \
-    pip install notebook && \
-    jupyter notebook \
-    --notebook-dir=/lw-reg --ip='*' --port=8888 \
-    --no-browser --allow-root"
+If you have mamba installed, you can run this instead (it will run faster):
+```
+% mamba env create --name py313_lwreg --file=https://raw.githubusercontent.com/rinikerlab/lightweight-registration/main/environment.yml
 ```
 
+You can then activate the new environment and install lwreg:
+```
+% conda activate py313_lwreg
+% python -m pip install git+https://github.com/rinikerlab/lightweight-registration
+```
+
+You can then verify that the install worked by doing:
+```
+% lwreg --help
+```
+
+If you want to use PostgreSQL as the database for lwreg, then you will also need to install the python connector for PostgreSQL:
+```
+% conda install -c conda-forge psycopg
+```
+
+For further information, consult the INSTALL.md file.
 
 ## Very basic usage demo
 
@@ -44,142 +57,39 @@ docker run -i -t -p 8888:8888 rdkit-lwreg /bin/bash -c "\
 ```
 % lwreg initdb --confirm=yes
 % lwreg register --smiles CCOCC
-1
-% lwreg register --smiles CCOCCC
-2
-% lwreg register --smiles CCNCCC
-3
-% lwreg register --smiles CCOCCC
-ERROR:root:Compound already registered
 % lwreg query --smiles CCOCCC
-2
 % lwreg retrieve --id 2
-(2, '\n     RDKit          2D\n\n  0  0  0  0  0  0  0  0  0  0999 V3000\nM  V30 BEGIN CTAB\nM  V30 COUNTS 6 5 0 0 0\nM  V30 BEGIN ATOM\nM  V30 1 C 0.000000 0.000000 0.000000 0\nM  V30 2 C 1.299038 0.750000 0.000000 0\nM  V30 3 O 2.598076 -0.000000 0.000000 0\nM  V30 4 C 3.897114 0.750000 0.000000 0\nM  V30 5 C 5.196152 -0.000000 0.000000 0\nM  V30 6 C 6.495191 0.750000 0.000000 0\nM  V30 END ATOM\nM  V30 BEGIN BOND\nM  V30 1 1 1 2\nM  V30 2 1 2 3\nM  V30 3 1 3 4\nM  V30 4 1 4 5\nM  V30 5 1 5 6\nM  V30 END BOND\nM  V30 END CTAB\nM  END\n', 'mol')
 ```
+
 
 ### Python
 ```
-In [1]: import lwreg
+>>> import lwreg
 
-In [3]: lwreg.initdb(confirm=True)
-Out[3]: True
+>>> from lwreg import utils
 
-In [4]: lwreg.register(smiles='CCO')
-Out[4]: 1
+>>> lwreg.set_default_config(utils.defaultConfig())   # you generally will want to provide more information about the database
 
-In [5]: lwreg.register(smiles='CCOC')
-Out[5]: 2
-
-In [6]: from rdkit import Chem
-
-In [7]: m = Chem.MolFromSmiles('CCOCC')
-
-In [8]: lwreg.register(mol=m)
-Out[8]: 3
-
-In [9]: lwreg.register(mol=m)
----------------------------------------------------------------------------
-IntegrityError                            Traceback (most recent call last)
-Input In [9], in <cell line: 1>()
-----> 1 lwreg.register(mol=m)
-
-File ~/Code/lightweight-registration/lwreg/utils.py:249, in register(config, mol, molfile, molblock, smiles, escape, fail_on_duplicate, no_verbose)
-    247 cn = _connect(config)
-    248 curs = cn.cursor()
---> 249 mrn = _register_mol(tpl, escape, cn, curs, config, fail_on_duplicate)
-    250 if not no_verbose:
-    251     print(mrn)
-
-File ~/Code/lightweight-registration/lwreg/utils.py:184, in _register_mol(tpl, escape, cn, curs, config, failOnDuplicate)
-    181     mhash, layers = hash_mol(sMol, escape=escape, config=config)
-    183     # will fail if the fullhash is already there
---> 184     curs.execute(
-    185         _replace_placeholders(
-    186             'insert into hashes values (?,?,?,?,?,?,?,?,?)'), (
-    187                 mrn,
-    188                 mhash,
-    189                 layers[RegistrationHash.HashLayer.FORMULA],
-    190                 layers[RegistrationHash.HashLayer.CANONICAL_SMILES],
-    191                 layers[RegistrationHash.HashLayer.NO_STEREO_SMILES],
-    192                 layers[RegistrationHash.HashLayer.TAUTOMER_HASH],
-    193                 layers[RegistrationHash.HashLayer.NO_STEREO_TAUTOMER_HASH],
-    194                 layers[RegistrationHash.HashLayer.ESCAPE],
-    195                 layers[RegistrationHash.HashLayer.SGROUP_DATA],
-    196             ))
-    198     cn.commit()
-    199 except _violations:
-
-IntegrityError: UNIQUE constraint failed: hashes.fullhash
-
-In [10]: lwreg.query(smiles='CCOC')
-Out[10]: [2]
-
-In [11]: lwreg.query(smiles='CCOCC')
-Out[11]: [3]
-
-In [12]: lwreg.query(smiles='CCOCO')
-Out[12]: []
-
-In [13]: lwreg.retrieve(id=2)
-Out[13]: 
-((2,
-  '\n     RDKit          2D\n\n  0  0  0  0  0  0  0  0  0  0999 V3000\nM  V30 BEGIN CTAB\nM  V30 COUNTS 4 3 0 0 0\nM  V30 BEGIN ATOM\nM  V30 1 C 0.000000 0.000000 0.000000 0\nM  V30 2 C 1.299038 0.750000 0.000000 0\nM  V30 3 O 2.598076 -0.000000 0.000000 0\nM  V30 4 C 3.897114 0.750000 0.000000 0\nM  V30 END ATOM\nM  V30 BEGIN BOND\nM  V30 1 1 1 2\nM  V30 2 1 2 3\nM  V30 3 1 3 4\nM  V30 END BOND\nM  V30 END CTAB\nM  END\n',
-  'mol'),)
-
-In [14]: lwreg.retrieve(ids=[2,3])
-Out[14]: 
-((2,
-  '\n     RDKit          2D\n\n  0  0  0  0  0  0  0  0  0  0999 V3000\nM  V30 BEGIN CTAB\nM  V30 COUNTS 4 3 0 0 0\nM  V30 BEGIN ATOM\nM  V30 1 C 0.000000 0.000000 0.000000 0\nM  V30 2 C 1.299038 0.750000 0.000000 0\nM  V30 3 O 2.598076 -0.000000 0.000000 0\nM  V30 4 C 3.897114 0.750000 0.000000 0\nM  V30 END ATOM\nM  V30 BEGIN BOND\nM  V30 1 1 1 2\nM  V30 2 1 2 3\nM  V30 3 1 3 4\nM  V30 END BOND\nM  V30 END CTAB\nM  END\n',
-  'mol'),
- (3,
-  '\n     RDKit          2D\n\n  0  0  0  0  0  0  0  0  0  0999 V3000\nM  V30 BEGIN CTAB\nM  V30 COUNTS 5 4 0 0 0\nM  V30 BEGIN ATOM\nM  V30 1 C 0.000000 0.000000 0.000000 0\nM  V30 2 C 1.299038 0.750000 0.000000 0\nM  V30 3 O 2.598076 -0.000000 0.000000 0\nM  V30 4 C 3.897114 0.750000 0.000000 0\nM  V30 5 C 5.196152 -0.000000 0.000000 0\nM  V30 END ATOM\nM  V30 BEGIN BOND\nM  V30 1 1 1 2\nM  V30 2 1 2 3\nM  V30 3 1 3 4\nM  V30 4 1 4 5\nM  V30 END BOND\nM  V30 END CTAB\nM  END\n',
-  'mol'))
-
-
-```
-
-## Custom standardization/filtering functions
-
-When using the Python API you have extensive control over the standardization and validation operations which are performed on the molecule.
-
-Start with a couple of examples showing what the 'fragment' and 'charge' built-in standardizers do:
-
-```
->>> config['standardization'] = 'fragment'
->>> Chem.MolToSmiles(lwreg.utils.standardize_mol(Chem.MolFromSmiles('CC[O-].[Na+]'),config=config))
-'CC[O-]'
->>> config['standardization'] = 'charge'
->>> Chem.MolToSmiles(lwreg.utils.standardize_mol(Chem.MolFromSmiles('CC[O-].[Na+]'),config=config))
-'CCO'
-```
-
-Now define a custom filter which rejects (by returning None) molecules which have a net charge and then use that:
-```
->>> def reject_charged_molecules(mol):
-...     if Chem.GetFormalCharge(mol):
-...         return None
-...     return mol
-...
->>> config['standardization'] = reject_charged_molecules
->>> Chem.MolToSmiles(lwreg.utils.standardize_mol(Chem.MolFromSmiles('CC[O-].[Na+]'),config=config))
-'CC[O-].[Na+]'
-```
-
-Here's an example which fails:
-
-```
->>> lwreg.utils.standardize_mol(Chem.MolFromSmiles('CC[O-]'),config=config) is None
+>>> lwreg.initdb()
+This will destroy any existing information in the registration database.
+  are you sure? [yes/no]: yes
 True
-```
 
-We can chain standardization/filtering operations together by providing a list. The individual operations are run in order. Here's an example where we attempt to neutralise the molecule by finding the charge parent and then apply our reject_charged_molecules filter:
-```
->>> config['standardization'] = ['charge',reject_charged_molecules]
->>> lwreg.utils.standardize_mol(Chem.MolFromSmiles('CC[O-]'),config=config) is None
-False
->>> lwreg.utils.standardize_mol(Chem.MolFromSmiles('CC[N+](C)(C)C'),config=config) is None
-True
-```
-That last one failed because the quarternary nitrogen can't be neutralized.
+>>> lwreg.register(smiles='CCO')
+1
 
-There are a collection of other standardizers/filters available in the module lwreg.standardization_lib
+>>> from rdkit import Chem
+
+>>> m = Chem.MolFromSmiles('CCOCC')
+
+>>> lwreg.register(mol=m)
+2
+
+>>> lwreg.query(smiles='CCO')
+[1]
+
+>>> lwreg.retrieve(id=2)
+{2: ('\n     RDKit          2D\n\n  0  0  0  0  0  0  0  0  0  0999 V3000\nM  V30 BEGIN CTAB\nM  V30 COUNTS 5 4 0 0 0\nM  V30 BEGIN ATOM\nM  V30 1 C 0.000000 0.000000 0.000000 0\nM  V30 2 C 1.299038 0.750000 0.000000 0\nM  V30 3 O 2.598076 -0.000000 0.000000 0\nM  V30 4 C 3.897114 0.750000 0.000000 0\nM  V30 5 C 5.196152 -0.000000 0.000000 0\nM  V30 END ATOM\nM  V30 BEGIN BOND\nM  V30 1 1 1 2\nM  V30 2 1 2 3\nM  V30 3 1 3 4\nM  V30 4 1 4 5\nM  V30 END BOND\nM  V30 END CTAB\nM  END\n',
+  'mol')}
+
+```
